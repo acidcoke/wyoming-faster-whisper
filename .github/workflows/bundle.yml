@@ -30,8 +30,6 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
         run: script/build_bundle ${{ matrix.flags }}
 
       - name: Smoke test

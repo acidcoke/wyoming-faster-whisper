@@ -65,18 +65,23 @@ if [ -n "$python_dist" ]; then
     cp -a "$python_dist" "$root/python"
 else
     echo "Looking up python-build-standalone for CPython $python_version ($arch)"
-    auth=()
-    [ -z "${GITHUB_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
-    url="$(
-        curl -fsSL "${auth[@]}" \
-            https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest |
-            grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 |
-            grep -E "/cpython-${python_version//./\\.}\.[0-9]+\+[0-9]+-${arch}-unknown-linux-gnu-install_only\.tar\.gz$" |
-            head -n1
-    )"
-    [ -n "$url" ] || { echo "No python-build-standalone asset found" >&2; exit 1; }
-    echo "Downloading $url"
-    curl -fsSL "$url" | tar xz -C "$root"   # unpacks to ./python
+    # The release API truncates the asset list (these releases have thousands
+    # of files), so find the release tag from the "latest" redirect and the
+    # file name from its SHA256SUMS, which lists every asset.
+    pbs="https://github.com/astral-sh/python-build-standalone/releases"
+    tag="${PBS_RELEASE:-$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$pbs/latest" | sed 's|.*/tag/||')}"
+    [ -n "$tag" ] || { echo "Could not determine python-build-standalone release" >&2; exit 1; }
+    sums="$(curl -fsSL "$pbs/download/$tag/SHA256SUMS")"
+    pattern="cpython-${python_version//./\\.}\.[0-9]+\+[0-9]+-${arch}-unknown-linux-gnu-install_only\.tar\.gz$"
+    line="$(grep -E " $pattern" <<<"$sums" | head -n1 || true)"
+    [ -n "$line" ] || { echo "No CPython $python_version $arch asset in release $tag" >&2; exit 1; }
+    sha="${line%% *}"
+    name="${line##* }"
+    echo "Downloading $name ($tag)"
+    curl -fsSL -o "$work/$name" "$pbs/download/$tag/${name//+/%2B}"
+    echo "$sha  $work/$name" | sha256sum -c -
+    tar xzf "$work/$name" -C "$root"   # unpacks to ./python
+    rm -f "$work/$name"
 fi
 
 py="$root/python/bin/python3"
