@@ -1,0 +1,49 @@
+name: Self-contained bundle
+
+# Builds the single-file executable from script/build_bundle on a native runner
+# for each architecture. The aarch64 one includes onnxruntime-gpu with the CUDA
+# 13 runtime and cuDNN, for NVIDIA GB10 machines (ASUS Ascent GX10, DGX Spark).
+# Download it from the run's "Artifacts" section.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - script/build_bundle
+      - .github/workflows/bundle.yml
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            flags: --gpu
+          - runner: ubuntu-24.04
+            flags: --cpu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: script/build_bundle ${{ matrix.flags }}
+
+      - name: Smoke test
+        run: |
+          bundle="$(ls dist/*.run)"
+          "$bundle" --help | head -n 5
+          "$bundle" --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wyoming-faster-whisper-${{ runner.arch }}
+          path: dist/*.run
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error

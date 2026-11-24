@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Build a single self-contained executable of the server.
+#
+# The output is one file (dist/wyoming-faster-whisper-<arch>.run) that carries
+# its own Python interpreter and every library, including - with --gpu - the
+# CUDA 13 runtime and cuDNN that onnxruntime-gpu needs. Copy it to the target
+# machine and run it; nothing has to be installed there except the NVIDIA
+# driver (for --gpu). On first start it unpacks itself into
+# ~/.cache/wyoming-faster-whisper/<build-id> and reuses that afterwards.
+#
+# It must be built ON the target architecture (an arm64 box for an arm64
+# bundle), since pip resolves wheels for the interpreter it runs. The GitHub
+# workflow .github/workflows/bundle.yml does this on an arm64 runner.
+#
+# Usage:
+#   script/build_bundle [--gpu|--cpu] [--python-version 3.12]
+#                       [--python-dist DIR] [--output FILE]
+#
+# --gpu (default on aarch64) installs onnxruntime-gpu for CUDA 13 plus the
+#   CUDA/cuDNN pip wheels, for NVIDIA GB10 machines (ASUS Ascent GX10, DGX
+#   Spark). Note that CTranslate2 has no arm64 CUDA build, so faster-whisper
+#   itself runs on the CPU there; qwen3-asr and onnx-asr run on the GPU.
+# --python-dist uses an existing relocatable Python install (a directory with
+#   bin/python3) instead of downloading python-build-standalone.
+set -euo pipefail
+
+this_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_dir="$(dirname "$this_dir")"
+
+arch="$(uname -m)"
+python_version="3.12"
+python_dist=""
+output=""
+gpu=""
+[ "$arch" = "aarch64" ] && gpu=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --gpu) gpu=1 ;;
+        --cpu) gpu="" ;;
+        --python-version) python_version="$2"; shift ;;
+        --python-dist) python_dist="$2"; shift ;;
+        --output) output="$2"; shift ;;
+        -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo_dir/pyproject.toml" | head -n1)"
+variant="$arch"
+[ -z "$gpu" ] || variant="$arch-cuda"
+output="${output:-$repo_dir/dist/wyoming-faster-whisper-$version-$variant.run}"
+
+work="$repo_dir/build/bundle-$variant"
+root="$work/root"
+rm -rf "$work"
+mkdir -p "$root" "$(dirname "$output")"
+
+# -----------------------------------------------------------------------------
+# 1. Relocatable Python
+# -----------------------------------------------------------------------------
+if [ -n "$python_dist" ]; then
+    echo "Copying Python from $python_dist"
+    cp -a "$python_dist" "$root/python"
+else
+    echo "Looking up python-build-standalone for CPython $python_version ($arch)"
+    auth=()
+    [ -z "${GITHUB_TOKEN:-}" ] || auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    url="$(
+        curl -fsSL "${auth[@]}" \
+            https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest |
+            grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 |
+            grep -E "/cpython-${python_version//./\\.}\.[0-9]+\+[0-9]+-${arch}-unknown-linux-gnu-install_only\.tar\.gz$" |
+            head -n1
+    )"
+    [ -n "$url" ] || { echo "No python-build-standalone asset found" >&2; exit 1; }
+    echo "Downloading $url"
+    curl -fsSL "$url" | tar xz -C "$root"   # unpacks to ./python
+fi
+
+py="$root/python/bin/python3"
+# Do not let the build see packages outside the bundle (~/.local, PYTHONPATH).
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH PYTHONHOME
+"$py" -c 'import sys; print("Bundled", sys.version)'
+
+# -----------------------------------------------------------------------------
+# 2. Dependencies
+# -----------------------------------------------------------------------------
+"$py" -m pip --version >/dev/null 2>&1 || "$py" -m ensurepip --upgrade
+pip=("$py" -m pip install --no-cache-dir --no-warn-script-location --root-user-action=ignore)
+"${pip[@]}" -U pip setuptools wheel
+
+if [ -n "$gpu" ]; then
+    extras="zeroconf,sherpa,onnx-asr-gpu,qwen3-asr,hass"
+else
+    extras="zeroconf,sherpa,onnx-asr,qwen3-asr,hass"
+fi
+# A regular (non-editable) install, so the bundle does not point back here.
+"${pip[@]}" "$repo_dir[$extras]"
+
+if [ -n "$gpu" ]; then
+    # faster-whisper and the qwen3-asr extra both pull the CPU onnxruntime,
+    # which shares its module with onnxruntime-gpu and clobbers it. Remove both
+    # and put the GPU build back alone (same reconciliation as Dockerfile.gpu).
+    #
+    # Unlike Dockerfile.gpu this is not held on CUDA 12: there is no torch or
+    # CUDA CTranslate2 in this bundle to match, and the [cuda,cudnn] extras
+    # ship the CUDA 13 runtime, cuBLAS and cuDNN as wheels, so the bundle does
+    # not depend on the CUDA toolkit of the machine it runs on - only on its
+    # driver. GB10 (sm_121) needs CUDA 13 anyway.
+    "$py" -m pip uninstall -y onnxruntime onnxruntime-gpu
+    "${pip[@]}" "onnxruntime-gpu[cuda,cudnn]" nvidia-cublas
+fi
+
+# Fail the build rather than ship a bundle that cannot import its own backends.
+"$py" - "$gpu" <<'EOF'
+import sys
+import faster_whisper, ctranslate2, onnxruntime, sherpa_onnx, onnx_asr, wyoming_faster_whisper  # noqa
+print("onnxruntime", onnxruntime.__version__, onnxruntime.get_available_providers())
+if sys.argv[1] and "CUDAExecutionProvider" not in onnxruntime.get_available_providers():
+    sys.exit("onnxruntime-gpu was not installed correctly")
+EOF
+
+# Trim what is never needed at runtime.
+rm -rf "$root/python/lib/python$python_version/test" \
+    "$root/python/lib/python$python_version/idlelib" \
+    "$root/python/lib/python$python_version/tkinter" \
+    "$root/python/lib/python$python_version/ensurepip"
+
+site_rel="$("$py" -c 'import sysconfig, os, sys; print(os.path.relpath(sysconfig.get_paths()["purelib"], sys.argv[1]))' "$root")"
+
+# Precompile so the first start does not try to write .pyc files beside a
+# read-only or shared extraction.
+"$py" -m compileall -q -j 0 "$root/python/lib" >/dev/null || true
+
+# -----------------------------------------------------------------------------
+# 3. Launcher (inside the bundle)
+# -----------------------------------------------------------------------------
+default_device="cpu"
+[ -n "$gpu" ] && default_device="cuda"
+
+cat > "$root/wyoming-faster-whisper" <<EOF
+#!/usr/bin/env bash
+# Launcher for the bundled server. Defaults mirror the Docker image; any
+# argument given on the command line wins.
+set -euo pipefail
+here="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+site="\$here/$site_rel"
+
+# CUDA runtime / cuDNN / cuBLAS shipped as pip wheels.
+for lib in "\$site"/nvidia/*/lib; do
+    if [ -d "\$lib" ]; then
+        LD_LIBRARY_PATH="\$lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+    fi
+done
+export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}"
+export PYTHONNOUSERSITE=1
+unset PYTHONHOME PYTHONPATH
+
+data_dir="\${WYOMING_DATA_DIR:-\${XDG_DATA_HOME:-\$HOME/.local/share}/wyoming-faster-whisper}"
+mkdir -p "\$data_dir"
+# Keep the library caches (Hugging Face, ModelScope) with the models.
+export HF_HOME="\${HF_HOME:-\$data_dir}"
+export MODELSCOPE_CACHE="\${MODELSCOPE_CACHE:-\$data_dir/modelscope}"
+
+has_arg() {
+    local name="\$1"; shift
+    for a in "\$@"; do
+        case "\$a" in "\$name"|"\$name"=*) return 0 ;; esac
+    done
+    return 1
+}
+
+defaults=()
+has_arg --uri "\$@" || [ -n "\${WYO_WHISPER_URI:-}\${WYO_WHISPER_URI_FILE:-}" ] ||
+    defaults+=(--uri 'tcp://0.0.0.0:10300')
+has_arg --data-dir "\$@" || [ -n "\${WYO_WHISPER_DATA_DIR:-}\${WYO_WHISPER_DATA_DIR_FILE:-}" ] ||
+    defaults+=(--data-dir "\$data_dir")
+has_arg --device "\$@" || [ -n "\${WYO_WHISPER_DEVICE:-}\${WYO_WHISPER_DEVICE_FILE:-}" ] ||
+    defaults+=(--device "\${STT_DEVICE:-$default_device}")
+
+exec "\$here/python/bin/python3" -m wyoming_faster_whisper "\${defaults[@]}" "\$@"
+EOF
+chmod +x "$root/wyoming-faster-whisper"
+
+# -----------------------------------------------------------------------------
+# 4. Self-extracting executable
+# -----------------------------------------------------------------------------
+payload="$work/payload.tar.gz"
+echo "Packing payload"
+tar -C "$root" -cf - . | gzip -6 > "$payload"
+build_id="$version-$variant-$(sha256sum "$payload" | cut -c1-12)"
+
+cat > "$output" <<EOF
+#!/usr/bin/env bash
+# wyoming-faster-whisper $version ($variant) - self-extracting bundle.
+#
+# Runs the server; all arguments are passed through (see --help). On first run
+# the bundle unpacks itself (~once, needs a few GB of disk) to
+#   \${WYOMING_BUNDLE_DIR:-\${XDG_CACHE_HOME:-~/.cache}/wyoming-faster-whisper/$build_id}
+# Models are stored in \${WYOMING_DATA_DIR:-~/.local/share/wyoming-faster-whisper}.
+#
+# Special arguments (must come first):
+#   --bundle-extract   unpack and exit
+#   --bundle-path      print the extraction directory and exit
+set -euo pipefail
+dest="\${WYOMING_BUNDLE_DIR:-\${XDG_CACHE_HOME:-\$HOME/.cache}/wyoming-faster-whisper/$build_id}"
+if [ "\${1:-}" = "--bundle-path" ]; then echo "\$dest"; exit 0; fi
+if [ ! -f "\$dest/.complete" ]; then
+    echo "Unpacking bundle to \$dest (first run only)..." >&2
+    tmp="\$dest.tmp.\$\$"
+    rm -rf "\$tmp"; mkdir -p "\$tmp"
+    line="\$(awk '/^__PAYLOAD_BELOW__\$/ { print NR + 1; exit }' "\$0")"
+    tail -n +"\$line" "\$0" | tar xz -C "\$tmp"
+    rm -rf "\$dest"; mv "\$tmp" "\$dest"; touch "\$dest/.complete"
+fi
+if [ "\${1:-}" = "--bundle-extract" ]; then echo "\$dest"; exit 0; fi
+exec "\$dest/wyoming-faster-whisper" "\$@"
+__PAYLOAD_BELOW__
+EOF
+cat "$payload" >> "$output"
+chmod +x "$output"
+
+echo "Built $output ($(du -h "$output" | cut -f1))"

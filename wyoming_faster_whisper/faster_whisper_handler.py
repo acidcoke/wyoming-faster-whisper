@@ -7,10 +7,37 @@ from typing import Any, Dict, Optional, Union
 import faster_whisper
 
 from .const import Transcriber
-from .device import ctranslate2_device
+from .device import ctranslate2_device, is_gpu
 from .languages import whisper_language
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _resolve_device(device: str) -> str:
+    """Fall back to the CPU, with a warning, when CTranslate2 has no CUDA.
+
+    The CTranslate2 wheels on PyPI are CUDA-enabled only for x86_64; on arm64
+    (e.g. NVIDIA GB10 / DGX Spark machines) they are CPU-only, and asking for
+    "cuda" raises at model load. Other backends in the same process may still
+    use the GPU, so --device cuda should not be fatal here.
+    """
+    if not is_gpu(device):
+        return device
+
+    try:
+        import ctranslate2  # pylint: disable=import-outside-toplevel
+
+        if ctranslate2.get_cuda_device_count() > 0:
+            return device
+    except Exception:  # pylint: disable=broad-exception-caught
+        return device
+
+    _LOGGER.warning(
+        "Device '%s' was requested but this CTranslate2 build has no CUDA "
+        "support (or no GPU is visible); running faster-whisper on the CPU.",
+        device,
+    )
+    return "cpu"
 
 
 class FasterWhisperTranscriber(Transcriber):
@@ -33,7 +60,7 @@ class FasterWhisperTranscriber(Transcriber):
 
         # CTranslate2 takes the GPU ordinal separately, so "cuda:1" has to be
         # split into device + device_index.
-        ct2_device, ct2_device_index = ctranslate2_device(device)
+        ct2_device, ct2_device_index = ctranslate2_device(_resolve_device(device))
         extra_args: Dict[str, Any] = {}
         if ct2_device_index is not None:
             extra_args["device_index"] = ct2_device_index

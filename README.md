@@ -457,6 +457,31 @@ install the same `onnxruntime` module and whichever lands second wins, silently,
 since the CPU provider still loads every model. Reinstall `onnxruntime-gpu`
 last. `Dockerfile.gpu` does exactly this and is the working reference.
 
+### Single-File Executable (GX10 / DGX Spark)
+
+`script/build_bundle` packs the server, its own Python, and all of its libraries
+into one self-extracting file that only needs to be copied to the target and run
+(no Python, Docker, or CUDA toolkit required there, just the NVIDIA driver). It
+must be built on the target's architecture; the **Self-contained bundle** GitHub
+workflow builds it on an arm64 runner and attaches it to the run as an artifact.
+
+On aarch64 it defaults to `--gpu`: `onnxruntime-gpu` for CUDA 13 plus the CUDA
+runtime, cuBLAS and cuDNN wheels, which suits NVIDIA GB10 machines (ASUS Ascent
+GX10, DGX Spark). There is no arm64 CUDA build of CTranslate2, so **faster-whisper
+itself runs on the CPU there** (it logs a warning and falls back);
+`qwen3-asr` and `onnx-asr` use the GPU. torch-based backends (transformers,
+FunASR) are not included.
+
+```sh
+chmod +x wyoming-faster-whisper-*-aarch64-cuda.run
+./wyoming-faster-whisper-*-aarch64-cuda.run --stt-library qwen3-asr --language en
+```
+
+The first start unpacks it to `~/.cache/wyoming-faster-whisper/` (a few GB).
+Defaults are `--uri tcp://0.0.0.0:10300`, `--device cuda` (`cpu` for a `--cpu`
+bundle) and `--data-dir ~/.local/share/wyoming-faster-whisper`; any of them can
+be overridden on the command line.
+
 ## Environment Variables
 
 Every command-line option can also be set from the environment, which is what
